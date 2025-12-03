@@ -1,12 +1,16 @@
 # Thoughts on Hybrid Storage via Sagas
 
+## Introduction
+
 We need a storage system that can handle massive amounts of data while still providing some guarantees typically offered by transactional databases.
 
 We need this because we sometimes requested to deliver systems to clients whose data volumes are an order of magnitude larger than previous installations. Ideally, we should not have to reconsider the system’s architecture in such time. Instead, we should design using approaches that operate far from their limits. That means the system should work reliably without heavy optimization of underlying systems or storages. We also want customers to be able to configure storage for new, previously unknown data sources. If customers configure it themselves, the system should work reasonably well without fine tuning or heavy normalization. This is even more important given that some requests may be heavy (e.g., deduplication, entity matching) and might be configured by customer staff without deep technical knowledge, so indexes won’t help in most cases. Additionally, we don’t know the amount of data customers will store from future connectors, so the ability to scale horizontally and cheaply is a strong selling point.
 
 The basic idea is to use two databases: a classic transactional database for ID generation and constraint checks, and a storage database that scales well but offers limited traditional database functionality. This may let us benefit from both worlds, though their disadvantages also apply. Whether such a system is good enough is a subject for research.
 
-Obvious limitation: this approach will generally be slower than using a single classic transactional database, except in some narrow cases. However, it scales much better and may still be good enough for large entities that grow over time or are much bigger in other installations. On the other hand, if a table is unlikely ever to grow large (millions of rows), keep it as a simple table in the transactional database for better performance and simplicity.
+## Obvious limitation
+
+This approach will generally be slower than using a single classic transactional database, except in some narrow cases. However, it scales much better and may still be good enough for large entities that grow over time or are much bigger in other installations. On the other hand, if a table is unlikely ever to grow large (millions of rows), keep it as a simple table in the transactional database for better performance and simplicity.
 
 ## Duality of mutations.
 
