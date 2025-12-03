@@ -10,7 +10,7 @@ The basic idea is to use two databases: a classic transactional database for ID 
 
 ## Obvious limitation
 
-This approach will generally be slower than using a single classic transactional database, except in some narrow cases. However, it scales much better and may still be good enough for large entities that grow over time or are big in some installations. On the other hand, if a table is unlikely ever to grow large (millions of rows), keep it as a simple table in the transactional database for better performance and simplicity.
+This approach will generally be slower than using a single classic transactional database, except in some narrow cases. However, it scales much better and may still be good enough for large entities that grow over time or are big in some installations. On the other hand, if a table is unlikely ever to grow large (tens/hundreds of millions of rows), keep it as a simple table in the transactional database for better performance and simplicity.
 
 ## Duality of mutations.
 
