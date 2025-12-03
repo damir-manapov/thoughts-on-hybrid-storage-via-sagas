@@ -36,7 +36,7 @@ We have the following tables:
 * A saga table, with saga ID, creation date and state
 * One ID-generation table per entity, with columns for the entity ID and the saga ID
 * One uniqueness-check table per entity. Columns: entity ID, saga ID, uniqueness name, and a column holding a hash of all fields participating in that particular uniqueness. If an entity has two distinct uniqueness constraints (two different sets of columns), this table will hold two rows: one with the hash for the first set and one for the second. To mimic traditional behavior that ignores uniqueness when any field is null, simply do not create a row for that entry’s constraint when any participating field is null.
-*One balance-tracking table per every balance we need to maintain for a given entity. Columns: entity ID, saga ID, balance change, and one column per balance dimension to check (see examples below).
+* One balance-tracking table per every balance we need to maintain for a given entity. Columns: entity ID, saga ID, balance change, and one column per balance dimension to check (see examples below).
 
 ## Examples of balance-tracking tables.
 
