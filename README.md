@@ -1,0 +1,1 @@
+# thoughts-on-hybrid-storage-by-sagas
