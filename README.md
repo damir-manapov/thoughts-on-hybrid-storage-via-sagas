@@ -83,3 +83,4 @@ The main bottlenecks are the transactional database’s throughput and the memor
 * How to define abandoned sagas?
 * How to handle partial updates?
 * What is the key metrics?
+* What is the key use cases we want to measure performance for to asses applicability of the concept?
