@@ -23,7 +23,7 @@ There are two main mutation styles: OLTP-like and ETL-like. This paper focuses o
 
 ## Basic idea
 
-Use the transactional database for ID generation and constraint checks. Only a small portion of the data is stored in the transactional database. The rest is kept in memory while checks are pending. If checks pass, the data is written to the storage database. Mutation progress is tracked by sagas in the transactional database. As soon as data is written to the storage database, the saga can be finalized. If problems arise, the saga rolls back by deleting partially written data. Readers query the storage database and see newly written data immediately, even if the saga is not yet finalized.
+Use the transactional database for ID generation and constraint checks. Only a small portion of the data is stored in the transactional database. The rest is kept in memory while checks are pending. If checks pass, the data is written to the storage database. Mutation progress is tracked by sagas in the transactional database. As soon as data is written to the storage database, the saga can be finalized. If problems arise, the saga rolls back by deleting partially written data. All readers go straight to the storage database, they dont touch transactional one. Also it worth mention that reads may see newly written data immediately, even if the saga is not yet finalized.
 
 ## Sagas
 
