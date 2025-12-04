@@ -86,3 +86,4 @@ The main bottlenecks are the transactional database’s throughput and the memor
 * What is the key use cases we want to measure performance for to asses applicability of the concept?
 * Possibility of migration one uniquiness schema to another due to chosen uniquiness storage;
 * What is a typical entity schamas we want to use in performanse measures?
+* How to mutate schema?
