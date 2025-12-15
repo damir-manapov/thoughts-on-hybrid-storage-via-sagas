@@ -74,6 +74,64 @@ We need to periodically detect abandoned sagas and either roll them back or proc
 
 It’s possible to write to the storage database and then roll back the saga for some reason. In that case, someone may briefly observe records that will eventually be rolled back as if they never existed. We consider such cases rare and acceptable for most scenarios, but you must assess whether this level of inconsistency is acceptable in your use case.
 
+## Typical Cases
+
+### Balance System for External Consumers
+
+Let's assume we need a balance system that allows tracking profile balances, accruing, and withdrawing them. There are multiple external systems that will use ours to display balances to their users and allow them to spend them. All such systems operate on the same users and the same balances. These could be our partners with whom we share internal balances, or different subdivisions of our company, each with their own mobile or web applications.
+
+We consider 150 million profiles with 2 interactions per day (accrual, balance check, and withdrawal in each interaction). We assume that all interactions will occur within 12 hours (excluding nights), the busiest hour will have three times the average load, and seasonal/unplanned peaks will be three times heavier than usual days.
+
+150m * 2 / 365 / 12 * 3 * 3 = ~620k — this is the number of interactions per hour we're targeting. That's roughly 200 interactions per second. So it would be great if our approach could handle such a hypothetical load.
+
+#### Request Patterns
+
+We will measure throughput and latency for both composed patterns (accrual, balance, withdrawal) and atomic operations: balance request, accrual, successful withdrawal, and unsuccessful withdrawal (insufficient balance). We will also measure mutation performance in the transactional database in isolation, in the storage database in isolation, and in the composition of both databases (balance queries are storage database isolated queries by nature).
+
+#### Already Stored Data Volumes
+
+As a target, we consider that such a system will consume 5 years of historical data from the old system and will operate for at least 5 more years. So we're interested in performance measurements for up to 10 years of data. Performance may degrade significantly as data volume grows. We will measure parameters for 0, 1, 5, and 10 years of history.
+
+10 years of history gives us 6 billion operations.
+
+## Table Width
+
+Different cases require different table widths. Our target is 100 columns per table. We would also like to consider smaller tables with 10 and 50 columns per table.
+
+## Number of Writers
+
+For simplicity, we assume that all load is handled by one process. More complex setups may be measured later.
+
+## Hardware for Performance Measurement
+
+We will gradually move from simple setups to more production-grade configurations. We'll start with simple setups on a developer's laptop: no clusters, just one plain PostgreSQL instance + one Trino worker. Then we'll proceed with a more complex setup, still on a developer's laptop: a three-node PostgreSQL cluster (master, sync replica, async replica) and a three-node Trino cluster (coordinator, two worker nodes). After that, we'll measure performance on a more production-like setup: the same clusters but on rented servers.
+
+## Improving Reliability with a Queue
+
+We have two main stages for handling writes: writing to the transactional database and writing to the storage database. In most cases, problems will occur at the transactional database stage due to constraint violations. An unsuccessful write at the first stage is much more expected and doesn't leave any partial state — the operation is discarded entirely since the transaction was rejected. The situation is different at the storage database stage: problems are unexpected and in most cases not related to the data itself. Furthermore, when writing to the storage database, there is already partial state saved in the transactional database. Additionally, writes to the storage database suffer from small, frequent writes. Therefore, it's worth considering writing to the storage database through a queue. This allows aggregating all writes from many application instances and handling them by one or a small number of writers in batches. This mechanism can be omitted if you don't have many application instances or are satisfied with performance without an additional queue. In such cases, it may still be worthwhile to batch all writes to the storage database within a single application instance.
+
+### Implementation Example with RxJS
+
+It's totally fine to implement this dependency-free, but an RxJS implementation might look like the following:
+
+### Implementation Example without Additional Dependencies
+
+## Optimistic Writes
+
+It's highly unlikely that a write will be unsuccessful if a durable queue is used for writing to the storage database. Therefore, a successful response can be sent back as soon as the write to the transactional database succeeds. Optimistic writes can also be considered without a queue, but in that case, it's much more likely that an operation reported as successful will eventually be rolled back.
+
+If optimistic writes are implemented, they can be enabled on a per-table basis through settings. Another possible scenario is to opt in optimistic behaviour on write cuntion call level if calling client considers possible inconsistencies bearable.
+
+An additional drawback of optimistic writes is that you often won't see an entry you just wrote if you query it immediately after the optimistic write succeeds.
+
+## Balance Checks
+
+Balance checks verify that balance changes stored in certain fields don't become negative when aggregated by given dimensions. There could be a more general approach — for example, more complex checks than just non-negative aggregations — but this case is the most common in our experience, so we've left generalization out of scope for now. Such checks are enforced by the transactional database. We plan to implement them using triggers since aggregations need to be performed.
+
+### Example Check on Create
+
+### More Complex Example for Create, Update, and Delete at the Same Time
+
 ## Bottlenecks
 
 The main bottlenecks are the transactional database’s throughput and the memory needed to hold data while processing completes. Writes to the storage database can be heavily batched when targeting throughput over latency. If latency matters too, many small writes to the storage database will significantly affect it.
