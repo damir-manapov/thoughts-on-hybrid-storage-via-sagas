@@ -132,6 +132,42 @@ Balance checks verify that balance changes stored in certain fields don't become
 
 ### More Complex Example for Create, Update, and Delete at the Same Time
 
+## Composing with ELT-ish Writes
+
+### Drawbacks of Mixing Different Styles of Loading for the Same Table
+
+While it's possible to apply different styles of working with data on the same table, we consider it to be a bad practice. Usually, you would want to implement additional logic around functions that write data — some on-the-fly data transformations, side effects, etc. Since different styles of data writing are quite different in implementation, you would need to reimplement such logic twice. It's hard to keep it consistent and debug. So it would be wise to keep only one writing style per table. You could keep both if one of them is really occasional and bypasses any additional logic. Users or systems that would be using such an additional method of writing should be well aware of such unsafe behavior though.
+
+### Steps to Write Data in ELT-ish Style
+
+Often we need to do some transformations on data before we write it to the main table: field renaming, mapping, linking to existing dictionaries, creating missing dictionary entries, etc. We consider such actions to be performed beforehand — in memory, in stage tables, etc. When all preparations are done, we expect an Iceberg stage table with the same columns and rows filled as expected to add or update in our target database. The ID column is expected to be filled with nulls.
+
+At that point, the following set of steps is taken:
+
+* Generate stage tables in the storage database as they are intended to be written to the transactional database
+* Check uniqueness inside the temporary table by unique field sets
+* Transfer stage tables to the transactional database
+* Check uniqueness on the same field sets but against rows in the target table in the transactional database
+* Write stage tables to target tables in the transactional database. Identifiers will be generated on such writes
+* Transfer generated identifiers to the full stage table in the storage database. IDs not present mean the row wasn't written due to an invariant violation or some other problem
+* Update the target table in the storage database with rows that have assigned identifiers
+
+Rows that don't pass checks may be marked in an additional column on the temp table or in an additional temp table.
+
+For transferring identifiers, you need a way to uniquely identify a row beyond its ID, which you obviously can't use while it's not yet assigned to the stage table in the storage database.
+
+This is a draft of the algorithm. Corner cases should be considered thoroughly. There are obvious problems with creating/updating rows and interaction with several tables of invariants at the same time.
+
+### Reporting Problems with Row Handling
+
+There are two approaches to handling data of rows with problems that prevent them from further processing. You may delete them and send information about them to logs, a different storage, or a table. Alternatively, you could keep them and just ignore them during further handling, optionally writing additional information about status or errors to temporary columns or tables.
+
+### Simplifications in Comparison with OLTP-ish Style of Writing
+
+While in OLTP-style writing we allow writes to different tables within the same saga, the ELT-style approach is simpler: we allow writing only to one table at a time. It is the developer of the ELT pipeline who is responsible for keeping cross-table data consistent. You need to define the order of writing to dependent tables and how to correct intended writes if not all rows of the previous table were written successfully.
+
+As long as reads go only to the storage database, we don't bother to somehow mark temporary rows in the transactional database. They are considered to be possibly rolled back anyway.
+
 ## Bottlenecks
 
 The main bottlenecks are the transactional database’s throughput and the memory needed to hold data while processing completes. Writes to the storage database can be heavily batched when targeting throughput over latency. If latency matters too, many small writes to the storage database will significantly affect it.
