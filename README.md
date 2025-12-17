@@ -114,11 +114,186 @@ We have two main stages for handling writes: writing to the transactional databa
 
 Such in-process microbatching may be built into the Trino client or into a wrapper around it.
 
-### Implementation Example with RxJS
+### Microbatch writer example
 
-It's totally fine to implement this dependency-free, but an RxJS implementation might look like the following:
+```typescript
+/**
+ * Microbatch writer for Trino/Iceberg.
+ *
+ * Problem solved:
+ * Trino/Iceberg has high per-write overhead (~100ms+ per INSERT). Writing rows
+ * individually results in terrible throughput (~10 ops/sec). By batching multiple
+ * rows into a single INSERT statement, we can achieve ~8,500 ops/sec.
+ *
+ * How it works:
+ * 1. Callers call write(row) which returns a Promise
+ * 2. Rows accumulate in an internal buffer
+ * 3. After `flushIntervalMs` (default 500ms), all buffered rows are flushed
+ *    as a single SQL INSERT statement
+ * 4. All pending Promises resolve/reject based on the batch result
+ *
+ * Trade-offs:
+ * - Latency: Each write waits up to `flushIntervalMs` before execution
+ * - Atomicity: All rows in a batch succeed or fail together
+ * - Contention: Multiple concurrent batchers writing to the same table/shards
+ *   cause conflicts (see measurements in docs - 50 workers = 50% failure rate)
+ *
+ * @template T - The row type (e.g., { id: number, name: string })
+ */
+export class TrinoBatchWriter<T> {
+  /**
+   * Buffer holding rows waiting to be flushed.
+   * Cleared on each flush; new rows go to a fresh buffer.
+   */
+  private buffer: T[] = [];
 
-### Implementation Example without Additional Dependencies
+  /**
+   * Promise callbacks for each buffered row.
+   * Parallel array to `buffer` - pending[i] corresponds to buffer[i].
+   * On flush success, all resolve(); on failure, all reject(error).
+   */
+  private pending: Array<{
+    resolve: () => void;
+    reject: (_err: Error) => void;
+  }> = [];
+
+  /**
+   * Timer handle for the scheduled flush.
+   * null when no flush is scheduled (either just flushed or currently flushing).
+   */
+  private timer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Guard flag to prevent overlapping flushes.
+   * While true, new writes won't schedule a timer - they'll be picked up
+   * after the current flush completes.
+   */
+  private flushing = false;
+
+  /**
+   * User-provided function that converts an array of rows into a SQL INSERT.
+   * Example: (rows) => `INSERT INTO t VALUES ${rows.map(r => `(${r.id}, '${r.name}')`).join(',')}`
+   * NOTE: Caller is responsible for proper SQL escaping!
+   */
+  private buildSql: (_rows: T[]) => string;
+
+  /**
+   * Milliseconds to wait before flushing accumulated rows.
+   * Lower = less latency but smaller batches; Higher = larger batches but more latency.
+   * Sweet spot depends on your write pattern and acceptable latency.
+   */
+  private flushIntervalMs: number;
+
+  /**
+   * @param buildSql - Function that builds INSERT SQL from array of rows
+   * @param flushIntervalMs - Max time to buffer rows before flushing (default: 500ms)
+   */
+  constructor(buildSql: (_rows: T[]) => string, flushIntervalMs: number = 500) {
+    this.buildSql = buildSql;
+    this.flushIntervalMs = flushIntervalMs;
+  }
+
+  /**
+   * Queue a row for writing.
+   *
+   * The returned Promise resolves when this row's batch is successfully written,
+   * or rejects if the batch fails. Note: if the batch fails, ALL rows in that
+   * batch fail together - there's no partial success.
+   *
+   * @param row - The row data to write
+   * @returns Promise that resolves on successful flush, rejects on failure
+   */
+  write(row: T): Promise<void> {
+    return new Promise((resolve, reject) => {
+      // Add row and its callbacks to the pending batch
+      this.buffer.push(row);
+      this.pending.push({ resolve, reject });
+
+      // Schedule a flush if one isn't already scheduled or in progress.
+      // If we're currently flushing, the flush() finally block will
+      // schedule the next flush for any rows that arrived during flush.
+      if (!this.timer && !this.flushing) {
+        this.timer = setTimeout(() => this.flush(), this.flushIntervalMs);
+      }
+    });
+  }
+
+  /**
+   * Internal flush implementation.
+   *
+   * Takes a snapshot of current buffer/pending, clears them for new writes,
+   * then executes the batch. This allows new writes to accumulate during
+   * the async Trino call without blocking.
+   */
+  private async flush(): Promise<void> {
+    // Nothing to flush - can happen if flushNow() called on empty buffer
+    if (this.buffer.length === 0) {
+      this.timer = null;
+      return;
+    }
+
+    // Mark as flushing to prevent new timers during the async operation
+    this.flushing = true;
+    this.timer = null;
+
+    // Snapshot and clear - new writes during flush go to fresh arrays
+    const rows = this.buffer;
+    const callbacks = this.pending;
+    this.buffer = [];
+    this.pending = [];
+
+    try {
+      // Build and execute the batched INSERT
+      const sql = this.buildSql(rows);
+      console.log(`[TrinoBatch] Flushing ${rows.length} rows`);
+      await trinoQuery(sql);
+
+      // Success - resolve all promises from this batch
+      callbacks.forEach((cb) => cb.resolve());
+    } catch (e) {
+      // Failure - reject all promises from this batch
+      // Common causes: write conflicts, schema issues, Trino unavailable
+      console.error(`[TrinoBatch] Flush failed for ${rows.length} rows:`, e);
+      callbacks.forEach((cb) => cb.reject(e as Error));
+    } finally {
+      this.flushing = false;
+
+      // If new rows arrived during the flush, schedule next flush.
+      // This ensures continuous throughput under sustained write load.
+      if (this.buffer.length > 0 && !this.timer) {
+        this.timer = setTimeout(() => this.flush(), this.flushIntervalMs);
+      }
+    }
+  }
+
+  /**
+   * Force immediate flush of any pending writes.
+   *
+   * Use cases:
+   * - Graceful shutdown: await writer.flushNow() before process exit
+   * - Testing: ensure writes complete before assertions
+   * - Low-latency requirement: flush after critical writes
+   *
+   * @returns Promise that resolves when flush completes
+   */
+  async flushNow(): Promise<void> {
+    // Cancel scheduled flush - we're flushing now
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    await this.flush();
+  }
+
+  /**
+   * Number of rows currently buffered awaiting flush.
+   * Useful for monitoring/metrics.
+   */
+  get pendingCount(): number {
+    return this.buffer.length;
+  }
+}
+```
 
 ### One more approach for batching
 
