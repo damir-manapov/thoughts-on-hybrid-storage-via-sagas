@@ -6,6 +6,8 @@ We need a storage system that can handle massive amounts of data while still pro
 
 We need this because we sometimes requested to deliver systems to clients whose data volumes are an order of magnitude larger than previous installations. Ideally, we should not have to reconsider the system’s architecture in such time. Instead, we should design using approaches that operate far from their limits. That means the system should work reliably without heavy optimization of underlying systems or storages. We also want customers to be able to configure storage for new, previously unknown data sources. If customers configure it themselves, the system should work reasonably well without fine tuning or heavy normalization. This is even more important given that some requests may be heavy (e.g., deduplication, entity matching) and might be configured by customer staff without deep technical knowledge, so indexes won’t help in most cases. Additionally, we don’t know the amount of data customers will store from future connectors, so the ability to scale horizontally and cheaply is a strong selling point.
 
+So, in short, we expect that the developed system can be spun up for another client with an order of magnitude more data than the previous one, can be hosted on usual mid-grade not specialized virtual machines, data is available to analytics and BIs, can be accessed by configurable requests not known beforehand, and can be configured and extended by customers' non-technical staff without prior strong technical knowledge.
+
 The basic idea is to use two databases: a classic transactional database for ID generation and constraint checks, and a storage database that scales well but offers limited traditional database functionality. This may let us benefit from both worlds, though their disadvantages also apply. Whether such a system is good enough is a subject for research.
 
 ## Obvious limitation
@@ -110,11 +112,17 @@ We will gradually move from simple setups to more production-grade configuration
 
 We have two main stages for handling writes: writing to the transactional database and writing to the storage database. In most cases, problems will occur at the transactional database stage due to constraint violations. An unsuccessful write at the first stage is much more expected and doesn't leave any partial state — the operation is discarded entirely since the transaction was rejected. The situation is different at the storage database stage: problems are unexpected and in most cases not related to the data itself. Furthermore, when writing to the storage database, there is already partial state saved in the transactional database. Additionally, writes to the storage database suffer from small, frequent writes. Therefore, it's worth considering writing to the storage database through a queue. This allows aggregating all writes from many application instances and handling them by one or a small number of writers in batches. This mechanism can be omitted if you don't have many application instances or are satisfied with performance without an additional queue. In such cases, it may still be worthwhile to batch all writes to the storage database within a single application instance.
 
+Such in-process microbatching may be built into the Trino client or into a wrapper around it.
+
 ### Implementation Example with RxJS
 
 It's totally fine to implement this dependency-free, but an RxJS implementation might look like the following:
 
 ### Implementation Example without Additional Dependencies
+
+### One more approach for batching
+
+As long as we already have a transactional database that handles concurrency well, we could write full data for the table to a special table with a jsonb column. Then we could read payloads from there using "FOR UPDATE SKIP LOCKED" so the same rows won't be handled by different workers. But we still need a way to acknowledge to the caller that the write was completed.
 
 ## Optimistic Writes
 
@@ -128,9 +136,68 @@ An additional drawback of optimistic writes is that you often won't see an entry
 
 Balance checks verify that balance changes stored in certain fields don't become negative when aggregated by given dimensions. There could be a more general approach — for example, more complex checks than just non-negative aggregations — but this case is the most common in our experience, so we've left generalization out of scope for now. Such checks are enforced by the transactional database. We plan to implement them using triggers since aggregations need to be performed.
 
-### Example Check on Create
+## Trigger example
 
-### More Complex Example for Create, Update, and Delete at the Same Time
+```sql
+CREATE OR REPLACE FUNCTION check_balance_not_negative()
+RETURNS TRIGGER AS $$
+DECLARE
+  new_balance INTEGER;
+  current_balance INTEGER;
+  check_profile_id INTEGER;
+  change_amount INTEGER;
+BEGIN
+  -- Determine which profile to check
+  IF TG_OP = 'DELETE' THEN
+    check_profile_id := OLD.profile_id;
+    change_amount := -OLD.amount;
+  ELSIF TG_OP = 'UPDATE' THEN
+    check_profile_id := NEW.profile_id;
+    change_amount := NEW.amount - OLD.amount;
+  ELSE
+    check_profile_id := NEW.profile_id;
+    change_amount := NEW.amount;
+  END IF;
+
+  -- Get current balance
+  SELECT COALESCE(SUM(amount), 0) INTO current_balance
+  FROM balance_changes
+  WHERE profile_id = check_profile_id;
+
+  -- Calculate new balance
+  new_balance := current_balance + change_amount;
+
+  IF new_balance < 0 THEN
+    RAISE EXCEPTION USING
+      ERRCODE = 'P0001',
+      MESSAGE = 'BALANCE_NEGATIVE',
+      DETAIL = jsonb_build_object(
+        'profile_id', check_profile_id,
+        'current_balance', current_balance,
+        'change_amount', change_amount,
+        'new_balance', new_balance,
+        'deficit', ABS(new_balance)
+      )::text;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  ELSE
+    RETURN NEW;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+## Example of assigning trigger to table
+
+```sql
+DROP TRIGGER IF EXISTS trigger_check_balance ON balance_changes;
+CREATE TRIGGER trigger_check_balance
+BEFORE INSERT OR UPDATE OR DELETE ON balance_changes
+FOR EACH ROW
+EXECUTE FUNCTION check_balance_not_negative();
+```
 
 ## Composing with ELT-ish Writes
 
@@ -172,6 +239,62 @@ As long as reads go only to the storage database, we don't bother to somehow mar
 
 The main bottlenecks are the transactional database’s throughput and the memory needed to hold data while processing completes. Writes to the storage database can be heavily batched when targeting throughput over latency. If latency matters too, many small writes to the storage database will significantly affect it.
 
+## Potential extensions
+
+These are thoughts on how to extend the storage layer further. They don't depend on a particular implementation of the underlying storage; it may simply be a usual transactional database. It expects such storage to be SQL-compatible, with common functionality one expects from such a database.
+
+### Decoupling entities extensions owned by different subsistems
+
+### Data workflows
+
+### Workflows of selections and filtering for particular entity 
+
+### Extended read functions as base for simple and aggregations
+
+### Reports
+
+## Preliminary result
+
+These aren't reliable results; they're more about upper limits. More thorough measurements need to be taken.
+
+Environments: developer's notebook, one node for Trino, trivial table with one column, one process handler, writes to Iceberg only. Another variant is the same but with locale trino cluster of corrdinator and two workers and locale postgres cluster of master, sync replica and async replica.
+
+Writes without microbatching yield about 10 operations per second; with microbatching at 100 milliseconds — 8.5 thousand operations per second.
+
+This shows that batching improves write performance drastically.
+
+## Preliminary testing of microbatching on Trino
+
+In-process microbatching is expected to degrade with an increased number of processes handling writes. This is clearly shown with a simple check:
+
+Half of writes fail with 50 concurrent workers, while with 5 workers all writes succeed. Latency is around 1 second with 5 workers, the same at p95, while with 10 workers it's around 1.1 seconds on average and 2.5 seconds at p95. So latency increases with contention as well, while being stable without contention.
+
+For a local Trino cluster (coordinator + 2 workers), results for 5 workers are similar regarding throughput, average and p95 latency.
+
+It's also worth mentioning that contention is based on writing to the same shards, so if different parts of the system work with different tables, they may scale independently.
+
+Measurements can be found in Appendix A.
+
+## Preliminary testing of balance checks
+
+Small data prefilling with 1 million entries spread across 100 profiles (10k ops per profile), no index on profile, checking balance on profile solely, creation row only in balance changes table:
+
+## Further operations on saved data
+
+The main focus here is on how to save data. But a big part of the application is how data will be handled further. Here is a list of typical request patterns we expect from a system. All of them are read-only operations, so they all go to the storage database, not hitting the transactional one.
+
+### Deduplication
+
+### Segments
+
+### Tags assignments
+
+### Filters on related entities
+
+## Note on SQL escaping
+
+The Trino client is based on HTTP requests. So query is vulnerable to SQL injection. Even though it has prepared statements, it doesn't help because calling such a statement assumes providing arguments through basic strings. This way, any filter that comes from user input will eventually be concatenated to the string sent as a query to Trino. Given that, we need to escape parameters. There are several libraries for this, but none of them are properly supported. We use `pg-format`. It is pretty old, archived, and hasn't been updated for 9 years. But it is based on the escaping algorithm implementation of PostgreSQL, has one source file of 250 lines, and no dependencies. As far as I know, there is no better alternative for escaping SQL identifiers and parameters.
+
 ## Not covered
 
 * How to define abandoned sagas?
@@ -181,3 +304,54 @@ The main bottlenecks are the transactional database’s throughput and the memor
 * Possibility of migration one uniquiness schema to another;
 * What is a typical entity schamas we want to use in performanse measures?
 * How to mutate schema?
+
+# Appendix A
+
+Simple checks of write contention with different numbers of workers and microbatching for 100 milliseconds. Write is Iceberg only, table is trivial with one column, no data prefilling. Local Compose setup with one Trino node.
+
+#### 50 workers
+
+status is 201: 58% — ✓ 13640 / ✗ 9501
+
+* failed_writes: 9501 - 747.826194/s
+* successful_writes: 13640 - 1073.607966/s
+* write_latency: avg=2357.609956, min=865, med=2632, max=8140, p(90)=3477, p(95)=3964
+
+#### 40 workers
+
+status is 201: 69% — ✓ 18520 / ✗ 8248
+
+failed_writes: 8248 - 658.628748/s
+successful_writes: 18520 - 1478.880263/s
+write_latency: avg=2033.658137 min=647, med=1866, max=5901, p(90)=2933, p(95)=3091
+
+#### 30 workers
+
+status is 201: 72% — ✓ 20596 / ✗ 7833
+
+* failed_writes: 7833 - 663.175549/s
+* successful_writes: 20596 - 1743.746153/s
+* write_latency: avg=1872.555559 min=587, med=1439, max=5729, p(90)=2996, p(95)=3476
+
+#### 20 workers
+
+status is 201: 84% — ✓ 29923 / ✗ 5660
+
+* failed_writes: 5660 - 486.457881/s
+*successful_writes: 29923 - 2571.78077/s
+*write_latency: avg=1475.367085 min=552, med=1102, max=5315, p(90)=2693, p(95)=2838.9
+
+#### 10 workers
+
+status is 201: 96%
+
+* failed_writes: 1425 - 130.351699/s
+* successful_writes: 45099 - 4125.425464/s
+* write_latency: avg=1108.33933 min=709, med=938, max=4345, p(90)=1328, p(95)=2584
+
+#### 5 workers
+
+status is 201: 100%
+
+* successful_writes: 51696 - 4773.13579/s
+* write_latency: avg=1002.483654 min=720, med=955, max=2697, p(90)=1056, p(95)=1089
